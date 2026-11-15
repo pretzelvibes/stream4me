@@ -1,0 +1,11 @@
+{
+  "id": "timstreams",
+  "name": "TimStreams",
+  "active": true,
+  "language": ["*"],
+  "thumbnail": "https://b.imgur.gg/hxNT915-logo.png",
+  "banner": "https://b.imgur.gg/hxNT915-logo.png",
+  "categories": ["live"],
+  "settings": [],
+  "tiny": true
+}
