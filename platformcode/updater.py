@@ -22,11 +22,9 @@ addonname = addon.getAddonInfo('name')
 
 _hdr_pat = re.compile("^@@ -(\d+),?(\d+)? \+(\d+),?(\d+)? @@.*")
 
-# Fork pretzelvibes/stream4me: gli utenti installano solo il branch "sports",
-# che contiene il canale TimStreams oltre all'addon base.
-branch = 'sports'
-user = 'pretzelvibes'
-repo = 'stream4me'
+branch = 'master'
+user = 'stream4me'
+repo = 'addon'
 addonDir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 maxPage = 5  # le api restituiscono 30 commit per volta, quindi se si è rimasti troppo indietro c'è bisogno di andare avanti con le pagine
 trackingFile = "last_commit.txt"
@@ -230,8 +228,7 @@ def updateFromZip(message=config.get_localized_string(80050)):
     remotefilename = 'https://github.com/' + user + "/" + repo + "/archive/" + branch + ".zip"
     localfilename = filetools.join(xbmc.translatePath("special://home/addons/"), "plugin.video.s4me.update.zip")
     destpathname = xbmc.translatePath("special://home/addons/")
-    # GitHub nomina la cartella estratta "<repo>-<branch>" (es. stream4me-sports)
-    extractedDir = filetools.join(destpathname, repo + "-" + branch)
+    extractedDir = filetools.join(destpathname, "addon-" + branch)
 
     logger.info("remotefilename=%s" % remotefilename)
     logger.info("localfilename=%s" % localfilename)
@@ -284,15 +281,6 @@ def updateFromZip(message=config.get_localized_string(80050)):
         return False
 
     dp.update(95)
-
-    # Sicurezza: se lo zip non contiene davvero l'addon non tocchiamo
-    # l'installazione corrente (evita di restare senza addon).
-    if not filetools.isfile(filetools.join(extractedDir, 'addon.xml')):
-        logger.error('addon.xml non trovato in ' + extractedDir)
-        dp.close()
-        remove(localfilename)
-        removeTree(extractedDir)
-        return False
 
     # puliamo tutto
     global addonDir
