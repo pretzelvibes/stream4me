@@ -11,3 +11,4 @@ bin/
 lib/abi
 tests/home/
 reports/
+dist/
