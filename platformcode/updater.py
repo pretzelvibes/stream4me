@@ -228,7 +228,8 @@ def updateFromZip(message=config.get_localized_string(80050)):
     remotefilename = 'https://github.com/' + user + "/" + repo + "/archive/" + branch + ".zip"
     localfilename = filetools.join(xbmc.translatePath("special://home/addons/"), "plugin.video.s4me.update.zip")
     destpathname = xbmc.translatePath("special://home/addons/")
-    extractedDir = filetools.join(destpathname, "addon-" + branch)
+    # GitHub estrae l'archivio nella cartella "<repo>-<branch>" (es. stream4me-sports)
+    extractedDir = filetools.join(destpathname, repo + "-" + branch)
 
     logger.info("remotefilename=%s" % remotefilename)
     logger.info("localfilename=%s" % localfilename)
