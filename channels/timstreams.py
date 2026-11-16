@@ -655,7 +655,7 @@ def _extract_media_playlist(url, referer):
     Segue un eventuale master playlist fino alla playlist multimediale.
     Restituisce (url_playlist, testo).
     """
-    text = _http_get(url, referer=referer).text
+    text = _http_get(url, referer=referer, timeout=(5, 15)).text
     for _ in _range(3):
         if '#EXT-X-STREAM-INF' not in text and '#EXT-X-MEDIA:' not in text:
             return url, text
@@ -667,16 +667,17 @@ def _extract_media_playlist(url, referer):
         if not variant:
             return url, text
         url = urljoin(url, variant)
-        text = _http_get(url, referer=referer).text
+        text = _http_get(url, referer=referer, timeout=(5, 15)).text
     return url, text
 
 
 def _resolve_stream(stream_url):
     """
     Apre la pagina del player, recupera il ticket e lo decodifica.
-    Restituisce (url_playlist_media, url_pagina_stream).
+    Restituisce (url_playlist_media, url_pagina_stream, url_ticket).
     """
-    response = _http_get(stream_url, headers={'Referer': host + '/'})
+    response = _http_get(stream_url, headers={'Referer': host + '/'},
+                         timeout=(5, 15))
     response.raise_for_status()
     html = response.text
     stream_page = response.url
@@ -689,7 +690,8 @@ def _resolve_stream(stream_url):
         raise ValueError('ticketUrl non trovato')
 
     ticket = urljoin(stream_page, ticket_match.group(1).replace('\\/', '/'))
-    ticket_response = _http_get(ticket, headers={'Referer': stream_page})
+    ticket_response = _http_get(ticket, headers={'Referer': stream_page},
+                                timeout=(5, 15))
     ticket_response.raise_for_status()
 
     master_url = _unpack_ticket(ticket_response.content, ticket)
@@ -697,7 +699,7 @@ def _resolve_stream(stream_url):
         raise ValueError('ticket non valido')
 
     media_url, _ = _extract_media_playlist(master_url, stream_page)
-    return media_url, stream_page
+    return media_url, stream_page, ticket
 
 
 # ============================================================
@@ -929,15 +931,24 @@ _PROXY_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
 _SEGMENT_LOCK = threading.Lock()
 _SEGMENT_CACHE = OrderedDict()
-_SEGMENT_CACHE_MAX = 6
+# La playlist locale accumula 6-10 segmenti (circa 30-40 s). La cache non deve
+# mai sfrattare un segmento ancora in lista: oltre questa soglia vengono
+# eliminati solo quelli già usciti dalla playlist (vedi _download_segment).
+_SEGMENT_CACHE_MAX = 8
 _SEGMENT_EVENTS = {}
+# URL attualmente presenti nella playlist servita al player.
+_LIVE_URLS = set()
 
 # Precaricamento: decodifica in anticipo i prossimi segmenti, così il player
-# non deve aspettare la decodifica PNG ad ogni richiesta.
+# non deve aspettare download e decodifica PNG ad ogni richiesta.
+# Due thread permettono di sovrapporre rete e decodifica: mentre uno decodifica
+# un segmento l'altro sta già scaricando il successivo (utile sui dispositivi
+# lenti, dove la sola decodifica Python può pesare centinaia di millisecondi).
 _PREFETCH_COND = threading.Condition()
 _PREFETCH_QUEUE = deque()
-_PREFETCH_THREAD = None
-_PREFETCH_MAX = 3
+_PREFETCH_THREADS = []
+_PREFETCH_WORKERS = 2
+_PREFETCH_MAX = 6
 
 _PROXY = {
     'server': None,
@@ -947,6 +958,62 @@ _PROXY = {
     'stream_page': '',
     'referer': host + '/'
 }
+
+# Playlist live servita dalla cache locale.
+#
+# Ogni ticket produce una playlist "fotografia" che non avanza mai: la stessa
+# URL resta ferma anche per minuti e il player, dopo aver consumato i 4
+# segmenti (15-24 s), si ferma. La finestra avanza solo chiedendo un nuovo
+# ticket, che costa 1-4 s ed è molto più economico della risoluzione completa
+# (pagina + JS + ticket: 10-30 s). Le finestre successive si sovrappongono
+# (verificato sui PTS), quindi il flusso resta continuo.
+#
+# Qui l'ultima playlist buona viene servita subito al player e un thread la
+# rinnova ogni pochi secondi chiedendo un nuovo ticket. La risoluzione
+# completa si fa solo se il ticket smette di funzionare.
+#
+# I segmenti delle finestre successive vengono accumulati invece di essere
+# sostituiti: inputstream.adaptive ha una latenza live di 16 s, più lunga di
+# una finestra da 15 s. Con la sola finestra corrente il player non trova il
+# punto da cui ripartire e a ogni salto di sequenza svuota il buffer; con
+# 30-40 s di segmenti ha sempre un punto valido e assorbe i vuoti del server.
+_LIVE_LOCK = threading.Lock()
+_LIVE = {
+    'text': '',            # ultima playlist multimediale valida (originale)
+    'base_url': '',        # URL per risolvere i segmenti relativi
+    'sequence': -1,        # #EXT-X-MEDIA-SEQUENCE dell'ultima playlist
+    'segments': [],        # [(sequenza, durata, url)] accumulati
+    'emit_last': -1,       # sequenza dell'ultimo segmento pubblicato
+    'fetched_at': 0.0,     # ultima lettura riuscita
+    'changed_at': 0.0,     # ultima volta che la finestra è avanzata
+    'target': 4.0,         # #EXT-X-TARGETDURATION della playlist
+    'last_try': 0.0,       # ultimo tentativo (anche fallito)
+    'last_request': 0.0,   # ultima richiesta del player
+    'started_at': 0.0,     # avvio dello stream corrente
+    'failures': 0,         # errori consecutivi
+    'busy': False,         # un aggiornamento è in corso
+    'full_busy': False,    # una risoluzione completa è in corso
+    'priming': False,      # primo riempimento in corso
+    'primed': threading.Event(),
+    'last_full': 0.0,      # ultima risoluzione completa
+    'generation': 0,       # cambia ad ogni nuovo stream
+    'thread': None,
+    'thread_gen': -1
+}
+
+# Il ticket della sessione corrente. Va riusato per ottenere finestre nuove:
+# è la via più rapida e non richiede di rieseguire il player JS.
+_TICKET_LOCK = threading.Lock()
+_TICKET = {'url': '', 'referer': ''}
+
+_LIVE_TIMEOUT = (4, 8)     # (connect, read): niente attese di 25 secondi
+_TICKET_TIMEOUT = (5, 12)  # il ticket a volte impiega 2-4 s
+_LIVE_INTERVAL = 0.5       # passo del thread di aggiornamento
+_LIVE_REFRESH_EVERY = 2.0  # ogni quanto chiedere una finestra nuova
+_LIVE_IDLE = 30.0          # senza richieste del player l'updater si ferma
+_LIVE_FULL_EVERY = 6.0     # non riprovare la pagina troppo spesso
+_LIVE_PRIME_TRIES = 3
+_LIVE_PRIME_WAIT = 25.0
 
 
 def _random_sid():
@@ -993,26 +1060,477 @@ def _rewrite_playlist(text, base_url, prefix):
     return '\n'.join(output) + '\n'
 
 
-def _fetch_playlist(url):
-    """Scarica una playlist; se la sessione è scaduta la rigenera e riprova."""
-    response = _http_get(url)
+def _fetch_playlist_once(url):
+    """Legge una playlist senza rifare la risoluzione completa.
+
+    Timeout corti: durante un blocco del server non vogliamo tenere occupato
+    un thread per decine di secondi.
+    """
+    response = _http_get(url, timeout=_LIVE_TIMEOUT, retries=0)
     if response.status_code in (403, 404, 410):
-        _refresh_stream()
-        url = _PROXY['media_url']
-        response = _http_get(url)
+        raise IOError('playlist non disponibile (%s)' % response.status_code)
     response.raise_for_status()
-    return response.text, url
+    return response.text, (response.url or url)
 
 
-def _refresh_stream():
+def _playlist_entries(text, base_url):
+    """[(sequenza, durata, url)] di una playlist multimediale.
+
+    La media-sequence è l'unico identificativo stabile di un segmento: gli URL
+    possono cambiare firma fra un ticket e l'altro, la sequenza no.
+    """
+    if not text or '#EXT-X-STREAM-INF' in text or '#EXT-X-MEDIA:' in text:
+        return []
+    sequence = _playlist_sequence(text)
+    if sequence < 0:
+        sequence = 0
+    entries = []
+    duration = 0.0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('#EXTINF:'):
+            try:
+                duration = float(stripped[8:].split(',')[0])
+            except (TypeError, ValueError):
+                duration = 0.0
+            continue
+        if stripped.startswith('#'):
+            continue
+        entries.append((
+            sequence + len(entries),
+            duration,
+            urljoin(base_url, stripped)
+        ))
+    return entries
+
+
+def _playlist_segments(text, base_url):
+    """URL assoluti dei segmenti di una playlist multimediale."""
+    return [url for _seq, _duration, url in _playlist_entries(text, base_url)]
+
+
+def _playlist_sequence(text):
+    """Numero di sequenza della playlist (-1 se assente)."""
+    match = re.search(r'#EXT-X-MEDIA-SEQUENCE:(\d+)', text or '')
+    return int(match.group(1)) if match else -1
+
+
+def _playlist_target(text):
+    """Durata nominale di un segmento (#EXT-X-TARGETDURATION)."""
+    match = re.search(r'#EXT-X-TARGETDURATION:\s*([0-9.]+)', text or '')
+    try:
+        return float(match.group(1)) if match else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_playlist(source_text, segments):
+    """Playlist locale con i segmenti accumulati.
+
+    Le sequenze sono rinumerate in modo contiguo: quando il server salta da
+    una finestra all'altra (anche di sette posizioni) non devono apparire
+    buchi, altrimenti il player crede che manchino dei segmenti.
+    """
+    lines = ['#EXTM3U']
+    for line in (source_text or '').splitlines():
+        stripped = line.strip()
+        if not stripped or not stripped.startswith('#'):
+            continue
+        if stripped == '#EXTM3U' or stripped.startswith('#EXTINF'):
+            continue
+        if stripped.startswith('#EXT-X-MEDIA-SEQUENCE'):
+            continue
+        if stripped.startswith('#EXT-X-TARGETDURATION'):
+            continue
+        if stripped.startswith('#EXT-X-ENDLIST'):
+            continue
+        if stripped.startswith('#EXT-X-PROGRAM-DATE-TIME'):
+            continue
+        if stripped not in lines:
+            lines.append(stripped)
+
+    longest = max([duration for _seq, duration, _url in segments] + [0.0])
+    lines.append('#EXT-X-TARGETDURATION:%d' % max(1, int(longest + 0.999)))
+    lines.append('#EXT-X-MEDIA-SEQUENCE:%d' % segments[0][0])
+    for _seq, duration, url in segments:
+        lines.append('#EXTINF:%.3f,' % duration)
+        lines.append(url)
+    return '\n'.join(lines) + '\n'
+
+
+def _live_stale_limit():
+    """Da quanti secondi una finestra ferma va considerata bloccata.
+
+    Una finestra contiene quattro segmenti: se non avanza per metà della sua
+    durata il player rischia di restare a secco. Sui canali (4 s per segmento)
+    sono 8 s; sugli eventi (6 s) 12 s.
+    """
+    with _LIVE_LOCK:
+        target = _LIVE['target'] or 4.0
+    return max(6.0, 2.0 * target)
+
+
+def _live_publish(text, base_url):
+    """Unisce la nuova finestra ai segmenti già noti e aggiorna la playlist.
+
+    Il server consegna quattro segmenti per volta, che si sovrappongono alla
+    finestra precedente: accumulandoli la playlist locale resta più lunga di
+    una singola finestra, così il player ha sempre da dove ripartire.
+    """
+    global _LIVE_URLS
+
+    entries = _playlist_entries(text, base_url)
+    now = time.time()
+    if not entries:
+        return
+
+    with _LIVE_LOCK:
+        newest = entries[-1][0]
+        if _LIVE['sequence'] >= 0 and newest < _LIVE['sequence']:
+            # Una risoluzione in background può finire dopo che il ticket ha
+            # già consegnato una finestra più recente: non riavvolgiamo il
+            # player con una playlist vecchia. Un salto enorme invece è un
+            # riavvio della numerazione lato server e va accettato.
+            if _LIVE['sequence'] - newest < 1000:
+                return
+
+        known = dict((seq, (duration, url))
+                     for seq, duration, url in _LIVE['segments'])
+        previous_newest = _LIVE['sequence']
+        for seq, duration, url in entries:
+            known[seq] = (duration, url)
+
+        # Quante posizioni nuove sono state aggiunte in coda: serve a
+        # rinumerare le sequenze senza buchi.
+        appended = len([seq for seq, _d, _u in entries if seq > previous_newest])
+        if previous_newest < 0:
+            emit_last = newest
+        else:
+            emit_last = _LIVE['emit_last'] + appended
+
+        target = _playlist_target(text) or _LIVE['target'] or 4.0
+        window = max(6, min(10, int(round(30.0 / target))))
+        ordered = sorted(known)[-window:]
+        segments = [(seq, known[seq][0], known[seq][1]) for seq in ordered]
+        first_emit = max(0, emit_last - len(segments) + 1)
+        emit_last = first_emit + len(segments) - 1
+        emitted = [
+            (first_emit + index, duration, url)
+            for index, (_seq, duration, url) in enumerate(segments)
+        ]
+
+        changed = newest != previous_newest
+        _LIVE['segments'] = segments
+        _LIVE['emit_last'] = emit_last
+        _LIVE['text'] = _build_playlist(text, emitted)
+        _LIVE['base_url'] = base_url
+        _LIVE['sequence'] = newest
+        if target > 0:
+            _LIVE['target'] = target
+        _LIVE['fetched_at'] = now
+        if changed:
+            _LIVE['changed_at'] = now
+        _LIVE['failures'] = 0
+
+    _LIVE_URLS = set(url for _seq, _duration, url in segments)
+
+    # La deduplica per URL evita di riscaricare i segmenti già presenti;
+    # quelli vecchi restano in coda solo se sono ancora nella finestra.
+    _prefetch_segments([url for _seq, _duration, url in segments])
+
+
+def _ticket_reset():
+    with _TICKET_LOCK:
+        _TICKET['url'] = ''
+        _TICKET['referer'] = ''
+
+
+def _refresh_stream(gen=None):
+    """Chiede un nuovo ticket e ne segue la playlist.
+
+    Restituisce (testo, url) oppure None se il ticket non ha risposto. Non fa
+    mai la risoluzione completa: quella resta a _full_resolve, perché costa
+    molto di più e va usata solo quando serve davvero.
+
+    Un errore di rete non invalida il ticket (i timeout del server sono
+    frequenti e temporanei); lo si scarta solo se il server risponde 403/404
+    oppure se il contenuto non è più decodificabile.
+    """
+    with _TICKET_LOCK:
+        ticket = _TICKET['url']
+        referer = _TICKET['referer']
+    if not ticket:
+        return None
+
+    if gen is not None:
+        with _LIVE_LOCK:
+            if gen != _LIVE['generation']:
+                return None
+
+    try:
+        response = _http_get(
+            ticket,
+            headers={'Referer': referer or (host + '/')},
+            timeout=_TICKET_TIMEOUT,
+            retries=0
+        )
+    except Exception:
+        return None
+
+    if response.status_code in (403, 404, 410):
+        _ticket_reset()
+        return None
+
+    try:
+        response.raise_for_status()
+        master_url = _unpack_ticket(response.content, ticket)
+        media_url, text = _extract_media_playlist(
+            master_url, referer or (host + '/')
+        )
+    except Exception:
+        _ticket_reset()
+        return None
+
+    if not text or '#EXT-X-STREAM-INF' in text:
+        return None
+
+    if gen is not None:
+        with _LIVE_LOCK:
+            if gen != _LIVE['generation']:
+                return None
+    _PROXY['media_url'] = media_url
+    return text, media_url
+
+
+def _full_resolve(gen):
+    """Risoluzione completa dalla pagina del player (lenta, ultima risorsa)."""
     with _REFRESH_LOCK:
+        with _LIVE_LOCK:
+            if gen != _LIVE['generation']:
+                return None
         stream_page = _PROXY.get('stream_page') or ''
         if not stream_page:
-            return
-        media_url, referer = _resolve_stream(stream_page)
+            return None
+
+        media_url, referer, ticket = _resolve_stream(stream_page)
+
+        # Se nel frattempo è partito un altro canale, questo ticket non vale.
+        with _LIVE_LOCK:
+            if gen != _LIVE['generation']:
+                return None
+        with _TICKET_LOCK:
+            _TICKET['url'] = ticket
+            _TICKET['referer'] = referer or stream_page
+
         _PROXY['media_url'] = media_url
         _PROXY['referer'] = referer or _PROXY['referer']
         logger.info('timstreams: URL stream aggiornato')
+        return _fetch_playlist_once(media_url)
+
+
+def _mark_full():
+    with _LIVE_LOCK:
+        _LIVE['last_full'] = time.time()
+
+
+def _full_resolve_worker(gen):
+    """Risoluzione completa eseguita fuori dal thread di aggiornamento.
+
+    La pagina del player può impiegare anche venti secondi quando il server è
+    congestionato. Farla qui evita di bloccare i tentativi via ticket, che
+    intanto possono ricominciare a funzionare da soli.
+    """
+    result = None
+    try:
+        result = _full_resolve(gen)
+    except Exception as exc:
+        with _LIVE_LOCK:
+            if gen == _LIVE['generation']:
+                _LIVE['failures'] += 1
+        logger.info('timstreams: risoluzione completa non riuscita (%s)' % exc)
+    if result is not None:
+        text, base_url = result
+        with _LIVE_LOCK:
+            stale = gen != _LIVE['generation']
+        if not stale:
+            _live_publish(text, base_url)
+    with _LIVE_LOCK:
+        if gen == _LIVE['generation']:
+            _LIVE['full_busy'] = False
+
+
+def _start_full_resolve(gen):
+    """Avvia la risoluzione completa se non ce n'è già una in corso."""
+    with _LIVE_LOCK:
+        if _LIVE['full_busy']:
+            return False
+        _LIVE['full_busy'] = True
+    thread = threading.Thread(target=_full_resolve_worker, args=(gen,))
+    thread.daemon = True
+    thread.start()
+    return True
+
+
+def _live_update():
+    """Un tentativo di aggiornamento, eseguito in background.
+
+    Il player non aspetta mai la rete: se il ticket non risponde si continua
+    a servire la playlist precedente. Le finestre si sovrappongono, quindi
+    basta chiedere un ticket nuovo ogni pochi secondi per non restare a secco.
+    """
+    with _LIVE_LOCK:
+        if _LIVE['busy']:
+            return
+        now = time.time()
+        if now - _LIVE['last_try'] < _LIVE_REFRESH_EVERY:
+            return
+        _LIVE['busy'] = True
+        _LIVE['last_try'] = now
+        gen = _LIVE['generation']
+        stale_for = now - (_LIVE['changed_at'] or _LIVE['started_at'] or now)
+        can_full = now - _LIVE['last_full'] >= _LIVE_FULL_EVERY
+
+    try:
+        result = _refresh_stream(gen)
+
+        with _TICKET_LOCK:
+            ticket_gone = not _TICKET['url']
+        # La pagina costa circa un secondo quando il server risponde, ma resta
+        # l'ultima risorsa: la si tenta quando il ticket è sparito oppure
+        # quando la finestra è ferma da metà della sua durata.
+        allow_full = can_full and (
+            ticket_gone or stale_for >= _live_stale_limit()
+        )
+
+        if result is None:
+            if allow_full:
+                _mark_full()
+                _start_full_resolve(gen)
+            raise IOError('playlist non disponibile')
+
+        text, base_url = result
+        entries = _playlist_entries(text, base_url)
+        newest = entries[-1][0] if entries else -1
+        with _LIVE_LOCK:
+            if newest >= 0:
+                unchanged = newest <= _LIVE['sequence']
+            else:
+                unchanged = text == _LIVE['text']
+
+        # Il ticket risponde ma continua a servire la stessa fotografia:
+        # senza una sessione nuova il player resterebbe fermo.
+        if unchanged and allow_full:
+            _mark_full()
+            _start_full_resolve(gen)
+
+        with _LIVE_LOCK:
+            stale = gen != _LIVE['generation']
+        if not stale:
+            _live_publish(text, base_url)
+
+    except Exception as exc:
+        with _LIVE_LOCK:
+            if gen == _LIVE['generation']:
+                _LIVE['failures'] += 1
+                failures = _LIVE['failures']
+            else:
+                failures = 0
+        # Durante un blackout il tentativo si ripete: logghiamo solo il primo
+        # errore e poi ogni tanto, per non riempire kodi.log.
+        if failures == 1 or (failures and failures % 20 == 0):
+            logger.info('timstreams: playlist non aggiornata (%s)' % exc)
+    finally:
+        with _LIVE_LOCK:
+            if gen == _LIVE['generation']:
+                _LIVE['busy'] = False
+
+
+def _live_updater(gen):
+    """Tiene aggiornata la playlist finché il player continua a richiederla."""
+    while True:
+        with _LIVE_LOCK:
+            if gen != _LIVE['generation']:
+                return
+            idle = time.time() - _LIVE['last_request']
+        if idle > _LIVE_IDLE:
+            return
+        _live_update()
+        time.sleep(_LIVE_INTERVAL)
+
+
+def _ensure_live_updater():
+    with _LIVE_LOCK:
+        gen = _LIVE['generation']
+        thread = _LIVE.get('thread')
+        if (thread is not None and thread.is_alive()
+                and _LIVE.get('thread_gen') == gen):
+            return
+        thread = threading.Thread(target=_live_updater, args=(gen,))
+        thread.daemon = True
+        _LIVE['thread'] = thread
+        _LIVE['thread_gen'] = gen
+    thread.start()
+
+
+def _live_prime():
+    """Primo riempimento della playlist, una volta per stream.
+
+    Gli altri chiamanti aspettano l'evento invece di duplicare la richiesta.
+    """
+    with _LIVE_LOCK:
+        if _LIVE['text']:
+            return _LIVE['text'], _LIVE['base_url']
+        owner = not _LIVE['priming']
+        _LIVE['priming'] = True
+        primed = _LIVE['primed']
+
+    if not owner:
+        primed.wait(_LIVE_PRIME_WAIT)
+        with _LIVE_LOCK:
+            return _LIVE['text'], _LIVE['base_url']
+
+    text = ''
+    base_url = ''
+    try:
+        url = _PROXY.get('media_url') or ''
+        for attempt in _range(_LIVE_PRIME_TRIES):
+            try:
+                text, base_url = _fetch_playlist_once(url)
+                break
+            except Exception:
+                if attempt + 1 < _LIVE_PRIME_TRIES:
+                    time.sleep(1.0)
+        if not text:
+            # L'URL iniziale non risponde: proviamo il ticket, poi la pagina.
+            result = _refresh_stream()
+            if result is None:
+                with _LIVE_LOCK:
+                    gen = _LIVE['generation']
+                result = _full_resolve(gen)
+            if result is not None:
+                text, base_url = result
+        if text:
+            _live_publish(text, base_url)
+        with _LIVE_LOCK:
+            return _LIVE['text'], _LIVE['base_url']
+    finally:
+        with _LIVE_LOCK:
+            _LIVE['priming'] = False
+        primed.set()
+
+
+def _live_playlist():
+    """Playlist per il player: subito dalla cache, refresh in background."""
+    with _LIVE_LOCK:
+        _LIVE['last_request'] = time.time()
+    _ensure_live_updater()
+
+    text, base_url = _live_prime()
+    if not text:
+        raise IOError('playlist non disponibile')
+    return text, base_url
 
 
 def _cache_touch(url):
@@ -1028,16 +1546,38 @@ def _cache_touch(url):
     _SEGMENT_CACHE[url] = segment
 
 
-def _download_segment(url):
-    response = _http_get(url)
-    response.raise_for_status()
-    segment = decode_segment(response.content)
+def _cache_segment(url, segment):
+    """Salva un segmento decodificato, sfrattando quelli non più in playlist.
 
+    I segmenti ancora elencati non vengono mai eliminati: inputstream.adaptive
+    legge con circa 16 secondi di ritardo e potrebbe chiederli da un momento
+    all'altro. La memoria resta comunque limitata, perché la playlist contiene
+    al massimo otto-dieci segmenti.
+    """
     with _SEGMENT_LOCK:
         _SEGMENT_CACHE[url] = segment
         while len(_SEGMENT_CACHE) > _SEGMENT_CACHE_MAX:
-            _SEGMENT_CACHE.popitem(last=False)
+            victim = None
+            for key in _SEGMENT_CACHE:
+                # Né quelli in playlist né quello appena scaricato: il nuovo
+                # segmento può non essere ancora stato pubblicato.
+                if key not in _LIVE_URLS and key != url:
+                    victim = key
+                    break
+            if victim is None:
+                break
+            _SEGMENT_CACHE.pop(victim)
 
+
+def _download_segment(url):
+    # Connessione breve e lettura generosa: la lettura è per singolo chunk,
+    # quindi una linea lenta ma stabile non viene interrotta, mentre un CDN
+    # bloccato non tiene in attesa il player per 50 secondi (25 + retry).
+    # In caso di errore il player (o il prossimo aggiornamento) riprova.
+    response = _http_get(url, timeout=(5, 20), retries=0)
+    response.raise_for_status()
+    segment = decode_segment(response.content)
+    _cache_segment(url, segment)
     return segment
 
 
@@ -1086,35 +1626,73 @@ def _prefetch_worker():
             pass
 
 
-def _prefetch_segments(segment_urls):
-    global _PREFETCH_THREAD
+def _start_prefetch_workers():
+    """Avvia (una sola volta) i thread che preparano i segmenti in anticipo."""
+    global _PREFETCH_THREADS
 
+    alive = [thread for thread in _PREFETCH_THREADS if thread.is_alive()]
+    _PREFETCH_THREADS = alive
+    while len(alive) < _PREFETCH_WORKERS:
+        thread = threading.Thread(target=_prefetch_worker)
+        thread.daemon = True
+        thread.start()
+        alive.append(thread)
+        _PREFETCH_THREADS = alive
+
+
+def _prefetch_segments(segment_urls):
+    """Accoda i segmenti mancanti, nell'ordine in cui il player li chiederà.
+
+    Una playlist HLS elenca i segmenti dal più vecchio al più recente e
+    inputstream.adaptive parte dal primo della finestra (la sua latenza live
+    predefinita, 16 s, è più lunga dei 15 s della finestra): accodando gli
+    ultimi tre si saltava proprio il segmento necessario all'avvio, che finiva
+    per essere scaricato solo su richiesta del player, con un'attesa in più.
+    """
     if not segment_urls:
         return
 
-    candidates = []
     with _SEGMENT_LOCK:
+        pending = set(_PREFETCH_QUEUE)
+        candidates = []
         for url in segment_urls:
-            if not url or url in candidates:
+            if not url or url in pending:
                 continue
             if url in _SEGMENT_CACHE or url in _SEGMENT_EVENTS:
                 continue
             candidates.append(url)
+            pending.add(url)
 
     if not candidates:
         return
 
-    if _PREFETCH_THREAD is None or not _PREFETCH_THREAD.is_alive():
-        thread = threading.Thread(target=_prefetch_worker)
-        thread.daemon = True
-        thread.start()
-        _PREFETCH_THREAD = thread
+    _start_prefetch_workers()
 
     with _PREFETCH_COND:
-        while _PREFETCH_QUEUE:
-            _PREFETCH_QUEUE.popleft()
-        _PREFETCH_QUEUE.extend(candidates[-_PREFETCH_MAX:])
-        _PREFETCH_COND.notify()
+        room = _PREFETCH_MAX - len(_PREFETCH_QUEUE)
+        if room > 0:
+            _PREFETCH_QUEUE.extend(candidates[:room])
+        _PREFETCH_COND.notify_all()
+
+
+def _warm_up_stream():
+    """Prepara in anticipo la playlist e i primi segmenti.
+
+    Tra la risoluzione dell'URL e l'apertura del player Kodi impiega circa un
+    secondo: lo sfruttiamo per riempire la cache, così il primo segmento è già
+    pronto (o quasi) quando inputstream.adaptive lo chiede. Su Firestick e
+    Raspberry questo toglie un'attesa iniziale di uno o due secondi.
+    """
+    def run():
+        try:
+            text, base_url = _live_prime()
+            _prefetch_segments(_playlist_segments(text, base_url))
+        except Exception as exc:
+            logger.info('timstreams: precaricamento non riuscito (%s)' % exc)
+
+    thread = threading.Thread(target=run)
+    thread.daemon = True
+    thread.start()
 
 
 class _ProxyServer(socketserver.ThreadingMixIn, http_server.HTTPServer):
@@ -1131,6 +1709,8 @@ class _ProxyServer(socketserver.ThreadingMixIn, http_server.HTTPServer):
 class _ProxyHandler(http_server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     timeout = 30
+    # Il player legge da 127.0.0.1: senza Nagle la playlist arriva subito.
+    disable_nagle_algorithm = True
 
     def do_GET(self):
         self._serve(True)
@@ -1149,26 +1729,17 @@ class _ProxyHandler(http_server.BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         upstream = params.get('u', [''])[0]
 
-        if route == 'playlist.m3u8' and not upstream:
-            upstream = _PROXY.get('media_url') or ''
-        if not upstream:
+        if not upstream and route != 'playlist.m3u8':
             self.send_error(404)
             return
 
         try:
             if route in ('playlist.m3u8', 'variant.m3u8'):
-                text, used_url = _fetch_playlist(upstream)
-                try:
-                    # Precarica i segmenti della playlist multimediale.
-                    if '#EXT-X-STREAM-INF' not in text:
-                        segment_urls = [
-                            urljoin(used_url, line.strip())
-                            for line in text.splitlines()
-                            if line.strip() and not line.strip().startswith('#')
-                        ]
-                        _prefetch_segments(segment_urls)
-                except Exception:
-                    pass
+                if upstream:
+                    text, used_url = _fetch_playlist_once(upstream)
+                else:
+                    # Cache locale: risposta immediata, aggiornamento in background.
+                    text, used_url = _live_playlist()
                 data = _rewrite_playlist(text, used_url, prefix).encode('utf-8')
                 content_type = 'application/vnd.apple.mpegurl'
 
@@ -1210,7 +1781,9 @@ class _ProxyHandler(http_server.BaseHTTPRequestHandler):
         pass
 
 
-def _start_proxy(media_url, stream_page, source_url=''):
+def _start_proxy(media_url, stream_page, source_url='', ticket_url=''):
+    global _LIVE_URLS
+
     with _PROXY_LOCK:
         _PROXY['media_url'] = media_url
         _PROXY['stream_page'] = source_url or stream_page
@@ -1223,6 +1796,40 @@ def _start_proxy(media_url, stream_page, source_url=''):
         with _PREFETCH_COND:
             while _PREFETCH_QUEUE:
                 _PREFETCH_QUEUE.popleft()
+
+        with _TICKET_LOCK:
+            _TICKET['url'] = ticket_url or ''
+            _TICKET['referer'] = stream_page or (host + '/')
+
+        now = time.time()
+        with _LIVE_LOCK:
+            old_primed = _LIVE.get('primed')
+            _LIVE['text'] = ''
+            _LIVE['base_url'] = ''
+            _LIVE['sequence'] = -1
+            _LIVE['segments'] = []
+            _LIVE['emit_last'] = -1
+            _LIVE['fetched_at'] = 0.0
+            _LIVE['changed_at'] = now
+            _LIVE['last_try'] = now
+            _LIVE['last_request'] = now
+            _LIVE['started_at'] = now
+            _LIVE['failures'] = 0
+            _LIVE['busy'] = False
+            _LIVE['full_busy'] = False
+            _LIVE['priming'] = False
+            _LIVE['target'] = 4.0
+            _LIVE['primed'] = threading.Event()
+            _LIVE['last_full'] = 0.0
+            _LIVE['generation'] += 1
+            _LIVE_URLS = set()
+        if old_primed is not None:
+            # Sblocca chi stava aspettando il primo riempimento del canale
+            # precedente: il suo evento non verrebbe mai impostato.
+            old_primed.set()
+
+        _start_prefetch_workers()
+        _ensure_live_updater()
 
         if _PROXY['server'] is None:
             server = _ProxyServer(('127.0.0.1', 0), _ProxyHandler)
@@ -1249,7 +1856,7 @@ def findvideos(item):
         return []
 
     try:
-        media_url, stream_page = _resolve_stream(stream_url)
+        media_url, stream_page, ticket_url = _resolve_stream(stream_url)
     except Exception as exc:
         logger.error('timstreams: estrazione non riuscita (%s)' % exc)
         # Non è un player TimStreams: lasciamo risolvere l'URL ai resolver
@@ -1260,7 +1867,8 @@ def findvideos(item):
             Download=False, Videolibrary=False
         )
 
-    port, sid = _start_proxy(media_url, stream_page, stream_url)
+    port, sid = _start_proxy(media_url, stream_page, stream_url, ticket_url)
+    _warm_up_stream()
     local_url = 'http://127.0.0.1:%d/p/%s/playlist.m3u8' % (port, sid)
     logger.info('timstreams: riproduzione da %s' % local_url)
 
