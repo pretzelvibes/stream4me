@@ -74,10 +74,36 @@ else:
 
 _LOCAL = threading.local()
 
+_DNS_LOCK = threading.Lock()
+_DNS_NOTICE = False
+
+
+def _install_dns_override():
+    """Attiva l'override DNS via DoH anche per le sessioni requests locali.
+
+    TimStreams non passa da httptools, che è il punto in cui l'addon monta
+    l'adapter responsabile dell'override: senza questa chiamata API, pagina,
+    ticket e segmenti userebbero il DNS dell'ISP e i domini bloccati non si
+    aprirebbero. La patch è globale e idempotente, quindi vale per tutte le
+    richieste del processo; la si ripete alla creazione di ogni sessione così
+    un cambio dell'impostazione ha effetto senza riavviare Kodi.
+    """
+    global _DNS_NOTICE
+
+    with _DNS_LOCK:
+        try:
+            from core import resolverdns
+            resolverdns.install_dns_override()
+        except Exception as exc:
+            if not _DNS_NOTICE:
+                _DNS_NOTICE = True
+                logger.info('timstreams: override DNS non disponibile (%s)' % exc)
+
 
 def _session():
     session = getattr(_LOCAL, 'session', None)
     if session is None and requests is not None:
+        _install_dns_override()
         session = requests.Session()
         session.verify = False
         session.headers.update({'User-Agent': UA})
@@ -93,6 +119,26 @@ def _reset_session():
         except Exception:
             pass
     _LOCAL.session = None
+
+
+def _flush_dns(url):
+    """Dimentica l'IP DoH del host dopo un errore di connessione.
+
+    CipherSuiteAdapter fa lo stesso per gli altri canali: la cache DNS dura
+    un'ora e, se l'IP risolto non è più raggiungibile, senza questo flush
+    ogni nuovo tentativo riproverebbe lo stesso indirizzo.
+    """
+    try:
+        hostname = urlparse(url).hostname
+    except Exception:
+        return
+    if not hostname:
+        return
+    try:
+        from core import resolverdns
+        resolverdns.flush(hostname)
+    except Exception:
+        pass
 
 
 def _http_get(url, headers=None, timeout=25, referer=None, retries=1):
@@ -112,6 +158,11 @@ def _http_get(url, headers=None, timeout=25, referer=None, retries=1):
             return session.get(url, headers=request_headers, timeout=timeout)
         except Exception as exc:
             last_error = exc
+            # Un errore di connessione può dipendere da un IP DoH non più
+            # valido: lo togliamo dalla cache prima di riprovare.
+            if (requests is not None and
+                    isinstance(exc, requests.exceptions.ConnectionError)):
+                _flush_dns(url)
             # Connessione keep-alive scaduta: la ricreiamo e riproviamo una volta.
             _reset_session()
             session = _session()
