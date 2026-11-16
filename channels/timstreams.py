@@ -48,8 +48,20 @@ if requests is not None:
 
 
 typo = support.typo
-host = support.config.get_channel_url()
-API = host.rstrip('/') + '/api'
+
+# Il dominio principale arriva da channels.json; timstreams.co.rw è il dominio
+# di riserva e serve la stessa API con gli stessi contenuti. Se il principale
+# non risponde (down, bloccato dall'ISP o certificato non valido) si passa
+# automaticamente all'altro, senza chiedere nulla all'utente.
+_PRIMARY_HOST = support.config.get_channel_url().rstrip('/')
+_BACKUP_HOST = 'https://timstreams.co.rw'
+_HOSTS = []
+for _candidate in (_PRIMARY_HOST, _BACKUP_HOST):
+    if _candidate and _candidate not in _HOSTS:
+        _HOSTS.append(_candidate)
+
+host = _PRIMARY_HOST
+API = host + '/api'
 UA = httptools.get_user_agent()
 BASE_HEADERS = {
     'User-Agent': UA,
@@ -58,6 +70,66 @@ BASE_HEADERS = {
 }
 API_TTL = 60
 _CACHE = {}
+
+# Dopo un failover si riprova il dominio principale ogni tanto, così si torna
+# a usarlo quando guarisce senza pagare un timeout a ogni richiesta.
+_PRIMARY_RETRY = 300.0
+_primary_retry_at = 0.0
+
+
+def _set_active_host(candidate):
+    """Rende attivo il dominio che ha risposto, così i referer lo seguono."""
+    global host, API, _primary_retry_at
+
+    candidate = (candidate or '').rstrip('/')
+    if not candidate:
+        return
+    if candidate != _PRIMARY_HOST:
+        # Anche se il backup era già attivo: il controllo del principale è
+        # appena fallito e va rimandato, altrimenti lo si ritenterebbe a ogni
+        # richiesta pagando un timeout.
+        _primary_retry_at = time.time() + _PRIMARY_RETRY
+    if candidate == host:
+        return
+    logger.info('timstreams: dominio attivo %s' % candidate)
+    host = candidate
+    API = host + '/api'
+    BASE_HEADERS['Referer'] = host + '/'
+
+
+def _api_hosts():
+    """Domini da provare, a partire da quello attivo."""
+    ordered = [host]
+    retry_primary = (host != _PRIMARY_HOST
+                     and time.time() >= _primary_retry_at)
+    if retry_primary:
+        # È passato abbastanza tempo: riproviamo il principale, che è la
+        # scelta preferita quando è raggiungibile.
+        ordered.insert(0, _PRIMARY_HOST)
+    for candidate in _HOSTS:
+        if candidate in ordered:
+            continue
+        if candidate == _PRIMARY_HOST and not retry_primary:
+            # Dopo un failover il principale resta in pausa fino allo scadere
+            # del timer, altrimenti ogni richiesta pagherebbe un timeout.
+            continue
+        ordered.append(candidate)
+    return ordered
+
+
+def _site_url(url):
+    """Riscrive i link del sito (loghi) sul dominio attivo.
+
+    Kodi scarica le immagini con il proprio stack di rete, quindi l'override
+    DNS del canale non le copre: se il principale è bloccato, un logo assoluto
+    su tim-streams.com non si vedrebbe. I due domini servono gli stessi file.
+    """
+    if not url:
+        return url
+    for base in _HOSTS:
+        if url == base or url.startswith(base + '/'):
+            return host + url[len(base):]
+    return url
 
 
 if PY3:
@@ -174,7 +246,11 @@ def _http_get(url, headers=None, timeout=25, referer=None, retries=1):
 # ============================================================
 
 def _api(path, force=False):
-    """Legge un endpoint JSON della API, con una piccola cache."""
+    """Legge un endpoint JSON della API, con una piccola cache.
+
+    Prova il dominio attivo e, se non risponde, quello di riserva: il canale
+    resta utilizzabile anche quando il principale è bloccato o spento.
+    """
     if requests is None:
         logger.error('timstreams: modulo requests non disponibile')
         return {}
@@ -184,16 +260,23 @@ def _api(path, force=False):
     if not force and cached and now - cached[0] < API_TTL:
         return cached[1]
 
-    try:
-        response = _http_get(API + path, headers=BASE_HEADERS, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict):
-            _CACHE[path] = (now, data)
+    for base in _api_hosts():
+        headers = dict(BASE_HEADERS)
+        headers['Referer'] = base + '/'
+        try:
+            response = _http_get(base + '/api' + path, headers=headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.error('timstreams API %s (%s): %s' % (path, base, exc))
+            continue
+        if not isinstance(data, dict) or not data:
+            logger.error('timstreams API %s (%s): risposta vuota' % (path, base))
+            continue
+        _set_active_host(base)
+        _CACHE[path] = (now, data)
         return data
-    except Exception as exc:
-        logger.error('timstreams API %s: %s' % (path, exc))
-        return {}
+    return {}
 
 
 def get_catalog(force=False):
@@ -365,8 +448,8 @@ def _event_item(item, event, lookup=None):
         title=title,
         fulltitle=title,
         plot='\n'.join(lines),
-        thumbnail=event.get('logo') or '',
-        fanart=event.get('logo') or '',
+        thumbnail=_site_url(event.get('logo')) or '',
+        fanart=_site_url(event.get('logo')) or '',
         kind='event',
         item_id=event.get('url') or '',
         event_time=event.get('time') or '',
@@ -384,8 +467,8 @@ def _channel_item(item, channel, genre_name=''):
         title=title,
         fulltitle=title,
         plot=plot,
-        thumbnail=channel.get('logo') or '',
-        fanart=channel.get('logo') or '',
+        thumbnail=_site_url(channel.get('logo')) or '',
+        fanart=_site_url(channel.get('logo')) or '',
         kind='channel',
         item_id=channel.get('url') or '',
         action='streams'
@@ -402,8 +485,8 @@ def _replay_item(item, replay):
         title=title,
         fulltitle=title,
         plot=plot,
-        thumbnail=replay.get('logo') or '',
-        fanart=replay.get('logo') or '',
+        thumbnail=_site_url(replay.get('logo')) or '',
+        fanart=_site_url(replay.get('logo')) or '',
         kind='replay',
         item_id=replay.get('url') or '',
         action='streams'
